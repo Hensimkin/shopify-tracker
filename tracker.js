@@ -2,7 +2,7 @@
         'use strict';
 
         // ===== Backend config =====
-        const BACKEND_URL = 'https://shopify-tracker-backend.onrender.com'; // <-- change when backend exists
+        const BACKEND_URL = 'no url'; // <-- change when backend exists
         const CLEAR_AFTER_SEND = true; // clear events after sending
 
         // ===== LocalStorage key =====
