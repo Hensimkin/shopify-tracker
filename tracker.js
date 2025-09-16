@@ -107,7 +107,7 @@
         async function flushIfThreshold() {
           const s = ensureShape();
           const count = totalEventCount(s);
-          if (count >= 150) {
+          if (count >= 5) {
             console.log('[ShopTracker] Threshold reached:', count, 'events. Flushing...');
             const res = await sendState(s, 'threshold_150');
             if (res.ok && CLEAR_AFTER_SEND) {
