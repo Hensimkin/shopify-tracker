@@ -107,7 +107,7 @@
         async function flushIfThreshold() {
           const s = ensureShape();
           const count = totalEventCount(s);
-          if (count >= 5) {
+          if (count >= 150) {
             console.log('[ShopTracker] Threshold reached:', count, 'events. Flushing...');
             const res = await sendState(s, 'threshold_150');
             if (res.ok && CLEAR_AFTER_SEND) {
@@ -317,7 +317,7 @@
         });
 
         // ===== Periodic time counting =====
-        const HEARTBEAT_MS = 5000;
+        const HEARTBEAT_MS = 300000;
         setInterval(() => {
           if (document.visibilityState === 'visible') API.countTimeTick();
         }, HEARTBEAT_MS);
