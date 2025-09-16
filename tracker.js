@@ -107,7 +107,7 @@
         async function flushIfThreshold() {
           const s = ensureShape();
           const count = totalEventCount(s);
-          if (count >= 5) {
+          if (count >= 150) {
             console.log('[ShopTracker] Threshold reached:', count, 'events. Flushing...');
             const res = await sendState(s, 'threshold_150');
             if (res.ok && CLEAR_AFTER_SEND) {
@@ -323,7 +323,7 @@
         }, HEARTBEAT_MS);
 
         // ===== Print localStorage JSON every 10s =====
-        const PRINT_MS = 10000;
+        const PRINT_MS = 30000;
         setInterval(() => {
           const state = loadState();
           console.log('[ShopTracker] STATE (every 10s):\n', pretty(state));
@@ -331,7 +331,7 @@
           flushIfThreshold();
         }, PRINT_MS);
 
-        const ASKAI_MS = 30000;
+        const ASKAI_MS = 500000;   //where you can adjust the interval time (in milliseconds) for asking ai
         setInterval(() => {
           // Always send the current session string only
           sendSessionToAskAI();
