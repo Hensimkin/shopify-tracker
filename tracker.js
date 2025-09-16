@@ -323,13 +323,13 @@
         }, HEARTBEAT_MS);
 
         // ===== Print localStorage JSON every 10s =====
-        const PRINT_MS = 30000;
-        setInterval(() => {
-          const state = loadState();
-          console.log('[ShopTracker] STATE (every 10s):\n', pretty(state));
-          // Optional: also check threshold on the timer (safety net)
-          flushIfThreshold();
-        }, PRINT_MS);
+        // const PRINT_MS = 30000;
+        // setInterval(() => {
+        //   const state = loadState();
+        //   console.log('[ShopTracker] STATE (every 10s):\n', pretty(state));
+        //   // Optional: also check threshold on the timer (safety net)
+        //   flushIfThreshold();
+        // }, PRINT_MS);
 
         const ASKAI_MS = 500000;   //where you can adjust the interval time (in milliseconds) for asking ai
         setInterval(() => {
