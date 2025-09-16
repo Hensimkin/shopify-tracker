@@ -1,247 +1,433 @@
 (function () {
+        'use strict';
 
-  console.log("✅ Tracker script loaded!");
-  // ======= CONFIG =======
-  const BACKEND_URL = "http://localhost:8080"; // change for prod
-  const EVALUATE_INTERVAL_MS = 20000;          // how often to ask backend/LLM
-  const BATCH_FLUSH_MS = 5000;                 // how often to send event batch
-  const MAX_BATCH = 25;                        // max events per /collect
-  const MODAL_COOLDOWN_DEFAULT = 180000;       // 3 min safety if backend forgets to send cooldown
+        // ===== Backend config =====
+        const BACKEND_URL = 'https://combination-church-much-listings.trycloudflare.com'; // <-- change when backend exists
+        const CLEAR_AFTER_SEND = true; // clear events after sending
 
-  // ======= SESSION STATE =======
-  const sessionId = (crypto.randomUUID?.() || (Date.now()+"-"+Math.random()));
-  const startedAt = Date.now();
-  let cartItems = 0;
-  let lastDecisionAt = 0;
-  let decisionCooldownMs = 0;
-  let timeOnSiteSeconds = 0;
-  let lastHeartbeat = Date.now();
-  let pageVisible = true;
+        // ===== LocalStorage key =====
+        const LS_KEY = 'shopify_tracker_state';
 
-  // ======= UTIL =======
-  function pageTypeFromLocation() {
-    const url = location.pathname;
-    if (/^\/$/.test(url)){
-      console.log("Home page detected");
-      return "Home";}
-       
-    if (/\/products\//.test(url)) return "Product";
-    if (/\/collections\//.test(url)) return "Collection";
-    if (/\/cart(?:\/|$)/.test(url)) return "Cart";
-    return "Other";
-  }
+        // ===== State shape =====
+        // {
+        //   session: "uuid",
+        //   events: { [pageName]: Event[] },
+        //   timeonpage: { [pageName]: number }, // ms
+        //   itemsInCart: number
+        // }
 
-  console.log("📄 Current page type:", pageTypeFromLocation());
+        // ===== Utilities =====
+        const now = () => Date.now();
+        const seconds = (ms) => Math.round(ms / 1000);
+        const pretty = (obj) => JSON.stringify(obj, null, 2);
 
-  function nowSec() { return Math.floor(Date.now()/1000); }
+        function uuid() {
+          try {
+            return crypto.randomUUID();
+          } catch {
+            return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          }
+        }
 
-  // ======= EVENT BUFFER =======
-  const events = [];
-  function pushEvent(evt) {
-    events.push({
-      ...evt,
-      session_id: sessionId,
-      ts: nowSec(),
-      url: location.href,
-      page_type: pageTypeFromLocation(),
-      ua: navigator.userAgent
-    });
-    if (events.length >= MAX_BATCH) flushBatch();
-  }
+        function loadState() {
+          try {
+            return JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+          } catch {
+            return {};
+          }
+        }
 
-  async function flushBatch() {
-    if (!events.length) return;
-    const batch = events.splice(0, events.length);
-    try {
-      await fetch(`${BACKEND_URL}/collect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        keepalive: true,
-        body: JSON.stringify({ session_id: sessionId, events: batch })
-      });
-    } catch (e) {
-      // swallow network errors; we don’t block UX
-      console.debug("collect failed:", e);
-      // push them back so we don't lose everything
-      events.unshift(...batch.slice(0, MAX_BATCH));
-    }
-  }
+        function saveState(s) {
+          localStorage.setItem(LS_KEY, JSON.stringify(s));
+        }
 
-  // ======= CART POLLING (Shopify /cart.js) =======
-  async function refreshCartCount() {
-    try {
-      const res = await fetch("/cart.js", { headers: { "Accept": "application/json" }});
-      if (!res.ok) return;
-      const data = await res.json();
-      cartItems = (data.item_count ?? 0);
-    } catch {}
-  }
+        function ensureShape() {
+          const s = loadState();
+          if (!s.session) s.session = uuid();
+          if (!s.events || typeof s.events !== 'object') s.events = {};
+          if (!s.timeonpage || typeof s.timeonpage !== 'object') s.timeonpage = {};
+          if (typeof s.itemsInCart !== 'number') s.itemsInCart = 0;
+          saveState(s);
+          return s;
+        }
 
-  // ======= HEARTBEAT / TIME-ON-SITE =======
-  function tickTime() {
-    const now = Date.now();
-    if (pageVisible) {
-      timeOnSiteSeconds += Math.round((now - lastHeartbeat) / 1000);
-    }
-    lastHeartbeat = now;
-  }
-  setInterval(tickTime, 1000);
+        // ===== Page naming =====
+        function pageNameFromLocation(loc = window.location) {
+          const p = loc.pathname.replace(/\/+$/, '') || '/';
+          if (p === '/') return 'Home:/';
+          if (/\/products\//.test(p)) return `Product:${p}`;
+          if (/\/collections\//.test(p)) return `Collection:${p}`;
+          if (/\/cart(?:\/|$)/.test(p)) return `Cart:${p}`;
+          return `Other:${p}`;
+        }
 
-  document.addEventListener("visibilitychange", () => {
-    pageVisible = !document.hidden;
-    pushEvent({ type: "visibility", state: pageVisible ? "visible" : "hidden" });
-  });
+        // ===== Runtime (not stored) =====
+        const runtime = {
+          currentPage: pageNameFromLocation(),
+          visibleSince: document.visibilityState === 'visible' ? now() : null,
+        };
 
-  // ======= URL & PAGE EVENTS =======
-  function trackPageView() {
-    pushEvent({ type: "page_view" });
-  }
 
-  // capture SPA-like navigations (some themes pushState when filtering, etc.)
-  (function wrapHistory() {
-    const _pushState = history.pushState;
-    const _replaceState = history.replaceState;
-    function fire() { trackPageView(); refreshCartCount(); }
-    history.pushState = function () { _pushState.apply(this, arguments); setTimeout(fire, 0); };
-    history.replaceState = function () { _replaceState.apply(this, arguments); setTimeout(fire, 0); };
-    window.addEventListener("popstate", fire);
-  })();
+        
 
-  // ======= CLICK TRACKING =======
-  function matchesAddToCart(el) {
-    // Dawn-ish selectors: product form submit buttons
-    return el.closest('form[action*="/cart/add"] button[type="submit"], button[name="add"], button.add-to-cart, button#AddToCart') ||
-           el.closest('button, a')?.textContent?.toLowerCase().includes("add to cart");
-  }
+        // ===== Event counting + sending =====
+        function totalEventCount(s) {
+          return Object.values(s.events).reduce((acc, arr) => acc + (Array.isArray(arr) ? arr.length : 0), 0);
+        }
 
-  function matchesWishlist(el) {
-    return el.closest('[data-wishlist], .wishlist, button[aria-label*="wishlist" i]') ||
-           el.closest('button, a')?.textContent?.toLowerCase().includes("wishlist");
-  }
+        async function sendState(s, reason = 'manual') {
+          const payload = {
+            reason,
+            ts: Math.floor(Date.now() / 1000),
+            session: s.session,
+            state: s,
+          };
 
-  document.addEventListener("click", async (e) => {
-    const el = e.target;
-    if (!el) return;
-    if (matchesAddToCart(el)) {
-      pushEvent({ type: "click", action: "add_to_cart" });
-      // cart count will change—refresh soon
-      setTimeout(refreshCartCount, 800);
-    } else if (matchesWishlist(el)) {
-      pushEvent({ type: "click", action: "wishlist" });
-    } else if (el.closest('[data-filter], .facets__item, .filter, [name*="filter"]')) {
-      pushEvent({ type: "click", action: "filter" });
-    }
-  }, { capture: true });
+          if (BACKEND_URL === 'no url') {
+            console.log('[ShopTracker] SEND (mock, no backend):', reason, payload);
+            return { ok: true, skipped: true };
+          }
 
-  // ======= PERIODIC EVALUATION =======
-  async function evaluateIfNeeded(reason = "interval") {
-    // cooldown after we showed a modal
-    const since = Date.now() - lastDecisionAt;
-    if (since < (decisionCooldownMs || MODAL_COOLDOWN_DEFAULT)) return;
+          try {
+            const res = await fetch(`${BACKEND_URL}/ingest`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
 
-    // snapshot
-    const payload = {
-      session_id: sessionId,
-      current_page: pageTypeFromLocation(),
-      url: location.href,
-      cart_items: cartItems,
-      time_on_site: timeOnSiteSeconds,
-      started_at: Math.floor(startedAt / 1000)
-    };
+            });
+            console.log('[ShopTracker] SEND ->', res.status);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return { ok: true };
+          } catch (err) {
+            console.warn('[ShopTracker] SEND failed:', err);
+            return { ok: false, error: String(err) };
+          }
+        }
 
-    try {
-      const res = await fetch(`${BACKEND_URL}/evaluate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      // expected: { show: boolean, message: string, cooldownMs?: number }
-      if (data?.show && data?.message) {
-        showModal(data.message);
-        lastDecisionAt = Date.now();
-        decisionCooldownMs = data.cooldownMs ?? MODAL_COOLDOWN_DEFAULT;
-        pushEvent({ type: "popup_shown", reason, message_len: data.message.length });
-        flushBatch();
-      }
-    } catch (e) {
-      console.debug("evaluate failed:", e);
-    }
-  }
+        async function flushIfThreshold() {
+          const s = ensureShape();
+          const count = totalEventCount(s);
+          if (count >= 5) {
+            console.log('[ShopTracker] Threshold reached:', count, 'events. Flushing...');
+            const res = await sendState(s, 'threshold_150');
+            if (res.ok && CLEAR_AFTER_SEND) {
+              // Clear only the events; keep timeonpage/session/cart
+              Object.keys(s.events).forEach((k) => (s.events[k] = []));
 
-  // evaluate periodically + after meaningful events
-  setInterval(() => evaluateIfNeeded("interval"), EVALUATE_INTERVAL_MS);
+              Object.keys(s.timeonpage).forEach((k) => (s.timeonpage[k] = 0));
 
-  // ======= BATCH FLUSH TIMER & UNLOAD =======
-  setInterval(flushBatch, BATCH_FLUSH_MS);
-  window.addEventListener("beforeunload", () => {
-    pushEvent({ type: "unload" });
-    flushBatch();
-  });
+              saveState(s);
+              console.log('[ShopTracker] Events cleared after flush.');
+            }
+          }
+        }
 
-  // ======= MODAL UI =======
-  const styles = `
-    .pe-modal-backdrop {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.35);
-      display: none; align-items: center; justify-content: center; z-index: 999999;
-    }
-    .pe-modal { background: #fff; max-width: 420px; width: calc(100% - 32px);
-      border-radius: 12px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-      font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-    }
-    .pe-modal h3 { margin: 0 0 8px; font-size: 18px; }
-    .pe-modal p { margin: 0 0 14px; line-height: 1.4; }
-    .pe-modal .pe-actions { display: flex; gap: 8px; justify-content: flex-end; }
-    .pe-btn {
-      border: 1px solid #111; background: #111; color: #fff; padding: 8px 12px;
-      border-radius: 8px; cursor: pointer; font-size: 14px;
-    }
-    .pe-btn.secondary { background: transparent; color: #111; }
-  `;
-  const styleEl = document.createElement("style");
-  styleEl.textContent = styles;
-  document.head.appendChild(styleEl);
+        // === CART ===
+        async function refreshCartCount() {
+          try {
+            const res = await fetch('/cart.js', { credentials: 'same-origin' });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            const s = ensureShape();
+            s.itemsInCart = Number(data.item_count) || 0;
+            saveState(s);
+            console.log('[ShopTracker] CART: itemsInCart =', s.itemsInCart);
+            return s.itemsInCart;
+          } catch (err) {
+            console.warn('[ShopTracker] CART: failed to fetch /cart.js', err);
+            return null;
+          }
+        }
 
-  const backdrop = document.createElement("div");
-  backdrop.className = "pe-modal-backdrop";
-  backdrop.innerHTML = `
-    <div class="pe-modal" role="dialog" aria-modal="true" aria-label="Message">
-      <h3>Just for you</h3>
-      <p class="pe-msg"></p>
-      <div class="pe-actions">
-        <button class="pe-btn secondary" data-action="dismiss">Not now</button>
-        <button class="pe-btn" data-action="accept">Got it</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(backdrop);
-  const msgEl = backdrop.querySelector(".pe-msg");
+        async function sendSessionToAskAI() {
+          const s = ensureShape(); // guarantees we have a session
+          const sessionStr = String(s.session || '');
 
-  function showModal(message) {
-    msgEl.textContent = message;
-    backdrop.style.display = "flex";
-    // basic focus trap: focus first button
-    backdrop.querySelector('[data-action="accept"]').focus();
-  }
-  function hideModal(action) {
-    backdrop.style.display = "none";
-    pushEvent({ type: "popup_action", action });
-    flushBatch();
-  }
+          
 
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) hideModal("backdrop");
-  });
-  backdrop.querySelector('[data-action="dismiss"]').addEventListener("click", () => hideModal("dismiss"));
-  backdrop.querySelector('[data-action="accept"]').addEventListener("click", () => hideModal("accept"));
+          if (BACKEND_URL === 'no url') {
+            console.log('[ShopTracker] ASKAI (mock, no backend):', sessionStr);
+            return { ok: true, skipped: true };
+          }
 
-  // ======= INITIAL BOOT =======
-  (async function boot() {
-    pushEvent({ type: "session_start" });
-    trackPageView();
-    await refreshCartCount();
-    // ask once on boot (useful if the user lands on cart/product with context)
-    setTimeout(() => evaluateIfNeeded("boot"), 1500);
-  })();
-})();
+          try {
+            const res = await fetch(`${BACKEND_URL}/askai`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain' },
+              body: sessionStr, // <-- only the session as raw string
+
+            });
+            const data = await res.json();
+
+            console.log('[ShopTracker] ASKAI decision:', data);
+
+
+            if (data.decision?.show_popup) {
+              console.log('Popup message:', data.decision.message);
+              showAskAIPopup(data.decision.message, data.decision.category);
+            }
+
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return { ok: true };
+          } catch (err) {
+            console.warn('[ShopTracker] ASKAI failed:', err);
+            return { ok: false, error: String(err) };
+          }
+        }
+
+        // ===== Public API =====
+        const API = {
+          createSession() {
+            const s = ensureShape();
+            if (!s.session) {
+              s.session = uuid();
+              saveState(s);
+            }
+            return s.session;
+          },
+
+          initStorage() {
+            return ensureShape();
+          },
+
+          countTimeTick() {
+            const s = ensureShape();
+            const pg = runtime.currentPage;
+            if (!pg) return;
+            if (!s.timeonpage[pg]) s.timeonpage[pg] = 0;
+
+            if (runtime.visibleSince != null) {
+              const dt = now() - runtime.visibleSince;
+              s.timeonpage[pg] += dt;
+              runtime.visibleSince = now();
+              saveState(s);
+            }
+          },
+
+          currentPageName() {
+            return runtime.currentPage;
+          },
+
+          recordClick(e) {
+            const target = e.target.closest ? e.target.closest("a,button,[role='button'],[data-action]") : e.target;
+
+            const meta = {
+              tag: target?.tagName?.toLowerCase() || e.target.tagName?.toLowerCase(),
+              id: target?.id || '',
+              classes: target?.className && typeof target.className === 'string' ? target.className : '',
+              text: (target?.innerText || '').trim().slice(0, 140),
+              href: target?.getAttribute?.('href') || '',
+            };
+
+            API.recordEvent('click', meta);
+            console.log('[ShopTracker] CLICK:', meta, 'page:', runtime.currentPage);
+
+            // CART heuristic
+            const addToCartSelector = [
+              'form[action*="/cart/add"]',
+              'button[name="add"]',
+              'button.add-to-cart',
+              '[data-add-to-cart]',
+              'form[action*="/cart/add"] [type="submit"]',
+            ].join(',');
+
+            if (target && (target.matches?.(addToCartSelector) || target.closest?.(addToCartSelector))) {
+              setTimeout(refreshCartCount, 800);
+            }
+          },
+
+          recordEvent(type, meta = {}) {
+            const s = ensureShape();
+            const pg = runtime.currentPage || pageNameFromLocation();
+            if (!s.events[pg]) s.events[pg] = [];
+            const evt = { type, ts: Math.floor(now() / 1000), url: location.href, ...meta };
+            s.events[pg].push(evt);
+            saveState(s);
+
+            // NEW: check after every event
+            flushIfThreshold();
+
+            return evt;
+          },
+
+          dump() {
+            const s = ensureShape();
+            console.log('session:', s.session);
+            console.log('currentPage:', runtime.currentPage);
+            console.log('itemsInCart:', s.itemsInCart);
+            console.log('events:', s.events);
+            console.log('timeonpage (ms):', s.timeonpage);
+            console.table(
+              Object.entries(s.timeonpage).map(([k, v]) => ({
+                page: k,
+                'time (s)': seconds(v),
+                events: (s.events[k] || []).length,
+              }))
+            );
+            return s;
+          },
+
+          resetAll() {
+            localStorage.removeItem(LS_KEY);
+            runtime.visibleSince = document.visibilityState === 'visible' ? now() : null;
+            runtime.currentPage = pageNameFromLocation();
+            return ensureShape();
+          },
+
+          refreshCartCount,
+          // optional manual flush
+          flushNow: async (reason = 'manual_button') => {
+            const s = ensureShape();
+            const res = await sendState(s, reason);
+            if (res.ok && CLEAR_AFTER_SEND) {
+              Object.keys(s.events).forEach((k) => (s.events[k] = []));
+              saveState(s);
+              console.log('[ShopTracker] Events cleared after manual flush.');
+            }
+            return res;
+          },
+        };
+
+        // expose API
+        window.ShopTracker = API;
+
+        // ===== Boot =====
+        API.initStorage();
+        const sessionId = API.createSession();
+        console.log('[ShopTracker] initialized. session:', sessionId);
+
+        if (document.visibilityState === 'visible') {
+          runtime.visibleSince = now();
+        }
+
+        API.recordEvent('page_view', { page: runtime.currentPage });
+        console.log('[ShopTracker] NAVIGATE: page_view ->', runtime.currentPage, location.href);
+
+        refreshCartCount();
+
+        // ===== Visibility handling =====
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'hidden') {
+            API.countTimeTick();
+            runtime.visibleSince = null;
+          } else {
+            runtime.visibleSince = now();
+            refreshCartCount();
+          }
+        });
+
+        // ===== Periodic time counting =====
+        const HEARTBEAT_MS = 5000;
+        setInterval(() => {
+          if (document.visibilityState === 'visible') API.countTimeTick();
+        }, HEARTBEAT_MS);
+
+        // ===== Print localStorage JSON every 10s =====
+        const PRINT_MS = 10000;
+        setInterval(() => {
+          const state = loadState();
+          console.log('[ShopTracker] STATE (every 10s):\n', pretty(state));
+          // Optional: also check threshold on the timer (safety net)
+          flushIfThreshold();
+        }, PRINT_MS);
+
+        const ASKAI_MS = 30000;
+        setInterval(() => {
+          // Always send the current session string only
+          sendSessionToAskAI();
+        }, ASKAI_MS);
+
+        // ===== Click tracking =====
+        document.addEventListener('click', API.recordClick, { capture: true });
+
+
+        function showAskAIPopup(message, category = "info") {
+          // Prevent duplicate popup
+          if (document.getElementById("askai-popup")) return;
+
+          // Backdrop
+          const backdrop = document.createElement("div");
+          backdrop.id = "askai-popup";
+          backdrop.style.position = "fixed";
+          backdrop.style.inset = "0";
+          backdrop.style.background = "rgba(0,0,0,.4)";
+          backdrop.style.display = "flex";
+          backdrop.style.alignItems = "center";
+          backdrop.style.justifyContent = "center";
+          backdrop.style.zIndex = "9999";
+
+          // Modal
+          const modal = document.createElement("div");
+          modal.style.background = "#fff";
+          modal.style.borderRadius = "10px";
+          modal.style.boxShadow = "0 5px 25px rgba(0,0,0,.3)";
+          modal.style.padding = "20px";
+          modal.style.maxWidth = "400px";
+          modal.style.width = "90%";
+          modal.style.textAlign = "center";
+          modal.style.fontFamily = "sans-serif";
+
+          // Title by category
+          const title = document.createElement("h3");
+          title.textContent =
+            category === "warn"
+              ? "Reminder"
+              : category === "error"
+              ? "Attention"
+              : "Notice";
+          title.style.marginTop = "0";
+
+          // Body message
+          const body = document.createElement("p");
+          body.textContent = message;
+
+          // Close button
+          const btn = document.createElement("button");
+          btn.textContent = "OK";
+          btn.style.marginTop = "15px";
+          btn.style.padding = "8px 16px";
+          btn.style.border = "none";
+          btn.style.borderRadius = "6px";
+          btn.style.cursor = "pointer";
+          btn.style.background = "#111";
+          btn.style.color = "#fff";
+
+          btn.addEventListener("click", () => backdrop.remove());
+          backdrop.addEventListener("click", (e) => {
+            if (e.target === backdrop) backdrop.remove();
+          });
+
+          modal.appendChild(title);
+          modal.appendChild(body);
+          modal.appendChild(btn);
+          backdrop.appendChild(modal);
+          document.body.appendChild(backdrop);
+        }
+
+        // ===== Navigation tracking =====
+        function handleNavigation() {
+          if (document.visibilityState === 'visible') API.countTimeTick();
+
+          runtime.currentPage = pageNameFromLocation();
+          runtime.visibleSince = document.visibilityState === 'visible' ? now() : null;
+
+          API.recordEvent('page_view', { page: runtime.currentPage });
+          console.log('[ShopTracker] NAVIGATE: page_view ->', runtime.currentPage, location.href);
+
+          refreshCartCount();
+          // Optional: check after navigation too
+          flushIfThreshold();
+        }
+
+        window.addEventListener('popstate', handleNavigation, true);
+        window.addEventListener('hashchange', handleNavigation, true);
+
+        ['pushState', 'replaceState'].forEach((fn) => {
+          const orig = history[fn];
+          history[fn] = function () {
+            const ret = orig.apply(this, arguments);
+            handleNavigation();
+            return ret;
+          };
+        });
+      })();
