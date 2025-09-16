@@ -331,7 +331,7 @@
         //   flushIfThreshold();
         // }, PRINT_MS);
 
-        const ASKAI_MS = 500000;   //where you can adjust the interval time (in milliseconds) for asking ai
+        const ASKAI_MS = 5000;   //where you can adjust the interval time (in milliseconds) for asking ai
         setInterval(() => {
           // Always send the current session string only
           sendSessionToAskAI();
